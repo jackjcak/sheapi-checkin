@@ -66,6 +66,10 @@ class AuthError(Exception):
     """登录态失效且无法自动恢复。"""
 
 
+class ConfigError(Exception):
+    """配置本身不合法（占位符未替换、含非法字符等）。"""
+
+
 class CaptchaError(Exception):
     """验证码获取或识别失败。"""
 
@@ -127,6 +131,60 @@ def _load_config(path: Optional[str]) -> Config:
 
     cfg.base_url = cfg.base_url.rstrip("/")
     return cfg
+
+
+def _state_has_credentials(cfg: Config) -> bool:
+    """上次运行保存的登录态也算凭据，否则会误报“没有凭据”。"""
+    try:
+        p = Path(cfg.state_file).expanduser()
+        if not p.exists():
+            return False
+        state = json.loads(p.read_text(encoding="utf-8"))
+        return bool(state.get("cookies") or state.get("access_token"))
+    except Exception:
+        return False
+
+
+def validate_config(cfg: Config) -> None:
+    """启动前做一次体检，把“配置写错了”和“网络不通”区分开。"""
+    problems: list[str] = []
+
+    # HTTP 头只能是 latin-1，cookie/token 里混入中文会抛很难懂的 UnicodeEncodeError
+    for field_name, value in (("cookie", cfg.cookie), ("token", cfg.token)):
+        if not value:
+            continue
+        try:
+            value.encode("latin-1")
+        except UnicodeEncodeError:
+            problems.append(
+                f"{field_name} 含非 ASCII 字符（比如中文），HTTP 请求头无法发送。"
+                f"请填入浏览器里复制的真实值，或把该字段留空"
+            )
+
+    # 常见的“忘了替换示例值”情况
+    placeholders = ("你的登录", "你的密码", "从浏览器复制", "your-email", "your-password",
+                    "xxxx", "粘贴")
+    if cfg.cookie:
+        if any(p in cfg.cookie for p in placeholders):
+            problems.append("cookie 看起来还是示例占位符，请替换成真实值或留空")
+    if cfg.username and any(p in cfg.username for p in ("你的登录", "your-email")):
+        problems.append("username 看起来还是示例占位符，请替换成真实账号")
+    if cfg.password and any(p in cfg.password for p in ("你的密码", "your-password")):
+        problems.append("password 看起来还是示例占位符，请替换成真实密码")
+
+    if not (cfg.cookie or cfg.token or (cfg.username and cfg.password) or _state_has_credentials(cfg)):
+        problems.append(
+            "没有任何可用凭据：请至少配置 cookie，或 username + password 中的一组"
+        )
+
+    if not cfg.base_url.startswith(("http://", "https://")):
+        problems.append(f"base_url 必须以 http:// 或 https:// 开头：{cfg.base_url}")
+
+    if problems:
+        raise ConfigError(
+            "配置检查未通过：\n  - " + "\n  - ".join(problems)
+            + "\n（可参考 config.example.json 的字段说明）"
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +319,11 @@ class SheApiClient:
                     method, url, headers=headers, timeout=self.cfg.timeout, **kwargs
                 )
                 return resp
+            except UnicodeEncodeError as exc:
+                raise ConfigError(
+                    f"请求头含无法发送的字符（HTTP 头只支持 latin-1）：{exc}。"
+                    f"请检查 cookie / token 是否混入了中文或其它非 ASCII 字符"
+                ) from exc
             except requests.RequestException as exc:
                 last_exc = exc
                 LOG.warning("请求 %s 失败（第 %d/%d 次）：%s",
@@ -618,8 +681,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         cfg.log_file = args.log_file
     setup_logging(args.verbose, cfg.log_file)
 
-    client = SheApiClient(cfg)
     try:
+        validate_config(cfg)
+        client = SheApiClient(cfg)
         client.ensure_auth()
         if args.dry_run:
             LOG.info("dry-run：登录态有效，未执行签到")
@@ -655,7 +719,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 "time": datetime.now().isoformat(timespec="seconds"),
             })
         return 0 if result["status"] in ("ok", "already") else 1
-    except (AuthError, CaptchaError, CheckinError) as exc:
+    except (AuthError, CaptchaError, CheckinError, ConfigError) as exc:
         LOG.error("%s", exc)
         if args.json_out:
             write_result(args.json_out, {"status": "error", "message": str(exc),
