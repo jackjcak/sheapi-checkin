@@ -686,7 +686,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         client = SheApiClient(cfg)
         client.ensure_auth()
         if args.dry_run:
-            LOG.info("dry-run：登录态有效，未执行签到")
+            # 空跑也要把登录态落盘：否则下次正式运行会重新登录、多识别一次验证码
+            client.save_state()
+            LOG.info("dry-run：登录态有效，未执行签到（登录态已保存，下次可直接复用）")
             if args.json_out:
                 info = client.quota_info() or {}
                 write_result(args.json_out, {
