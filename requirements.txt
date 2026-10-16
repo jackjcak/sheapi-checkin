@@ -1,0 +1,5 @@
+requests>=2.28.0
+# 可选：用于自动识别图形验证码（体积较大，约 100MB+，含 onnxruntime）
+# ddddocr>=1.4.0
+
+内容由AI生成

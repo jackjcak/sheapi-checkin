@@ -1,0 +1,91 @@
+name: sheapi 自动签到
+
+# 定时说明：GitHub Actions 的 cron 使用 UTC 时区。
+# "0 0 * * *" = UTC 00:00 = 北京时间 08:00
+# 定时任务在高峰期可能被延迟几分钟到几十分钟，属正常现象。
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  # 支持在 Actions 页面手动点击运行，方便首次验证
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只检查登录态，不真正签到"
+        type: boolean
+        default: false
+
+# 最小权限：只需要读代码，不需要写任何东西
+permissions:
+  contents: read
+
+# 避免两次运行重叠导致状态文件互相覆盖
+concurrency:
+  group: sheapi-checkin
+  cancel-in-progress: false
+
+jobs:
+  checkin:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+
+      - name: 准备 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          # 验证码自动识别为可选能力，装不上也不阻断流程（会回退到其它方案）
+          pip install ddddocr || echo "::warning title=ddddocr 安装失败::将回退到其它验证码方案"
+
+      # 用滚动缓存保存 cookie/token，让下次运行能复用登录态
+      # key 带 run_id 保证每次都写入新缓存；restore-keys 保证总能取到最近一次
+      - name: 恢复登录态缓存
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: sheapi-state-${{ github.run_id }}
+          restore-keys: |
+            sheapi-state-
+
+      - name: 执行签到
+        id: checkin
+        continue-on-error: true
+        env:
+          SHEAPI_USERNAME: ${{ secrets.SHEAPI_USERNAME }}
+          SHEAPI_PASSWORD: ${{ secrets.SHEAPI_PASSWORD }}
+          SHEAPI_COOKIE: ${{ secrets.SHEAPI_COOKIE }}
+          SHEAPI_STATE: state/sheapi_state.json
+        run: |
+          mkdir -p state logs
+          ARGS="--show-status --json-out logs/result.json"
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS="$ARGS --dry-run"
+          fi
+          python auto_checkin.py $ARGS 2>&1 | tee logs/checkin.log
+
+      - name: 写入运行摘要
+        if: always()
+        run: |
+          python ci_summary.py logs/result.json >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: 失败时保留日志
+        if: failure() || steps.checkin.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkin-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 3
+
+      - name: 汇总失败状态
+        if: steps.checkin.outcome == 'failure'
+        run: |
+          echo "::error title=签到失败::请看下方的 Job Summary 与日志 artifact 了解详情"
+          exit 1

@@ -1,0 +1,11 @@
+# 复制到仓库根目录并改名为 .gitignore
+# 登录态与日志：绝对不要提交
+state/
+sheapi_state.json
+logs/
+checkin.log
+captcha_*.png
+
+# 含明文账号密码的配置
+config.json
+.env
